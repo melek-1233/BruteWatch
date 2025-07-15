@@ -1,6 +1,5 @@
 ## Security Onion 2.4
 
-Security Onion 2.4 is here!
 
 ## Screenshots
 
