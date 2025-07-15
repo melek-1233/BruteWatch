@@ -40,10 +40,4 @@ https://docs.securityonion.net/en/2.4/download.html
 
 https://docs.securityonion.net/en/2.4/installation.html
 
-### FAQ
 
-https://docs.securityonion.net/en/2.4/faq.html
-
-### Feedback
-
-https://docs.securityonion.net/en/2.4/community-support.html
