@@ -1,0 +1,32 @@
+{
+	"name": "elastic-defend-endpoints",
+	"namespace": "default",
+	"description": "",
+	"package": {
+	  "name": "endpoint",
+	  "title": "Elastic Defend",
+	  "version": "8.17.0",
+	  "requires_root": true
+	},
+	"enabled": true,
+	"policy_id": "endpoints-initial",
+	"vars": {},
+	"inputs": [
+	  {
+		"type": "endpoint",
+		"enabled": true,
+		"config": {
+		  "integration_config": {
+			"value": {
+			  "type": "endpoint",
+			  "endpointConfig": {
+				"preset": "DataCollection"
+			  }
+			}
+		  }
+		},
+		"streams": []
+	  }
+	]
+  }
+  

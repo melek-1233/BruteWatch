@@ -1,0 +1,680 @@
+#!/bin/bash
+
+# Copyright Security Onion Solutions LLC and/or licensed to Security Onion Solutions LLC under one
+# or more contributor license agreements. Licensed under the Elastic License 2.0 as shown at 
+# https://securityonion.net/license; you may not use this file except in compliance with the
+# Elastic License 2.0.
+
+if [ -f /usr/sbin/so-common ]; then
+	. /usr/sbin/so-common
+fi
+
+if [ -f /usr/sbin/so-elastic-fleet-common ]; then
+	. /usr/sbin/so-elastic-fleet-common
+fi
+
+function usage() {
+	echo "Usage: $0 -o=<operation> -m=[id]"
+	echo ""
+	echo " where <operation> is one of the following:"
+	echo ""
+	echo "      add: Accepts a new key and adds the minion files"
+	echo "   delete: Removes the key and deletes the minion files"
+	echo "     list: Lists all keys with hashes"
+	echo "   reject: Rejects a key"
+	echo "  restart: Restart a minion (reboot)"
+	echo "     test: Perform minion test"
+	echo ""
+	exit 1
+}
+
+if [[ $# -lt 1 ]]; then
+	usage
+fi
+
+for i in "$@"; do
+	case $i in
+		-o=*|--operation=*)
+			OPERATION="${i#*=}"
+			shift 
+			;;
+		-m=*|--minionid=*)
+			MINION_ID="${i#*=}"
+			shift 
+			;;
+
+		# The following args are used internally during setup, not to be specified manually.
+		-e=*|--esheap=*)
+			ES_HEAP_SIZE="${i#*=}"
+			shift
+			;;
+		-n=*|--mgmtnic=*)
+			MNIC="${i#*=}"
+			shift
+			;;
+		-d=*|--description=*)
+			NODE_DESCRIPTION="${i#*=}"
+			shift
+			;;
+		-a=*|--monitor=*)
+			INTERFACE="${i#*=}"
+			shift
+			;;
+		-i=*|--ip=*)
+			MAINIP="${i#*=}"
+			shift
+			;;		
+		-*|--*)
+			echo "Unknown option $i"
+			exit 1
+			;;
+		*)
+			usage
+		;;
+	esac
+done
+
+PILLARFILE=/opt/so/saltstack/local/pillar/minions/$MINION_ID.sls
+ADVPILLARFILE=/opt/so/saltstack/local/pillar/minions/adv_$MINION_ID.sls
+
+function getinstallinfo() {
+	# Pull from file
+	INSTALLVARS=$(sudo salt "$MINION_ID" cp.get_file_str /opt/so/install.txt --out=newline_values_only)
+	source <(echo $INSTALLVARS)
+}
+
+function pcapspace() {
+	if [[ "$OPERATION" == "setup" ]]; then
+		# Use 25% for PCAP
+		PCAP_PERCENTAGE=1
+		DFREEPERCENT=21
+		local SPACESIZE=$(df -k /nsm | tail -1 | awk '{print $2}' | tr -d \n)
+	else
+
+		local NSMSIZE=$(salt "$MINION_ID" disk.usage --out=json | jq -r '.[]."/nsm"."1K-blocks" ')
+		local ROOTSIZE=$(salt "$MINION_ID" disk.usage --out=json | jq -r '.[]."/"."1K-blocks" ')
+	
+		if [[ "$NSMSIZE" == "null" ]]; then
+			# Looks like there is no dedicated nsm partition. Using root
+			local SPACESIZE=$ROOTSIZE
+		else
+			local SPACESIZE=$NSMSIZE
+		fi
+	fi
+
+	local s=$(( $SPACESIZE / 1000000 ))
+	local s1=$(( $s / 4 * $PCAP_PERCENTAGE ))
+
+	MAX_PCAP_SPACE=$s1
+
+}
+
+function testMinion() {
+	# Always run on the host, since this is going to be the manager of a distributed grid, or an eval/standalone.
+	# Distributed managers must run this in order for the sensor nodes to have access to the so-tcpreplay image.
+	so-test
+	result=$?
+
+	# If this so-minion script is not running on the given minion ID, run so-test remotely on the sensor as well
+	local_id=$(lookup_grain id)	
+	if [[ ! "$local_id" =~ "${MINION_ID}_" && "$local_id" != "${MINION_ID}" ]]; then
+		salt "$MINION_ID" cmd.run 'so-test'
+		result=$?
+	fi
+
+	exit $result
+}
+
+function restartMinion() {
+	salt "$MINION_ID" system.reboot --async
+	result=$?
+
+	exit $result
+}
+
+function listMinions() {
+	salt-key list -F --out=json
+	exit $?
+}
+
+function rejectMinion() {
+	salt-key -y -r $MINION_ID
+	exit $?
+}
+
+function acceptminion() {
+	salt-key -y -a $MINION_ID
+}
+
+function deleteMinion() {
+	salt-key -y -d $MINION_ID
+}
+
+function deleteMinionFiles () {
+	rm -f $PILLARFILE
+	rm -f $ADVPILLARFILE
+}
+
+# Create the minion file
+function create_minion_files() {
+	mkdir -p /opt/so/saltstack/local/pillar/minions
+    touch $ADVPILLARFILE
+	if [ -f "$PILLARFILE" ]; then
+		rm $PILLARFILE
+	fi
+}
+
+# Add Elastic settings to the minion file
+function add_elasticsearch_to_minion() {
+    printf '%s\n'\
+		"elasticsearch:"\
+		"  enabled: True"\
+		"  esheap: '$ES_HEAP_SIZE'"\
+		"  " >> $PILLARFILE
+}
+
+
+# Add Elastic Agent settings to the minion file
+function add_elastic_agent_to_minion() {
+    printf '%s\n'\
+		"elasticagent:"\
+		"  enabled: True"\
+		"  " >> $PILLARFILE
+}
+
+# Add Elastic Fleet Server settings to the minion file
+function add_fleet_to_minion() {
+
+    # Create ES Token for Fleet server (Curl to Kibana API)
+	# TODO: Add error handling
+    ESTOKEN=$(curl -K /opt/so/conf/elasticsearch/curl.config -L -X POST "localhost:5601/api/fleet/service_tokens" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' |  jq -r .value)
+
+    # Write out settings to minion file
+    printf '%s\n'\
+		"elasticfleet:"\
+		"  enabled: True"\
+		"  config:"\
+		"    server:"\
+		"      es_token: '$ESTOKEN'"\
+		"  " >> $PILLARFILE
+}
+
+# Add IDH Services info to the minion file
+function add_idh_to_minion() {
+	printf '%s\n'\
+	"idh:"\
+	"  enabled: True"\
+	"  restrict_management_ip: $IDH_MGTRESTRICT"\
+	"  " >> $PILLARFILE
+}
+
+function add_logstash_to_minion() {
+	# Create the logstash advanced pillar
+	printf '%s\n'\
+		"logstash:"\
+		"  enabled: True"\
+		"  config:"\
+		"    pipeline_x_workers: $CPUCORES"\
+		"  settings:"\
+		"    lsheap: $LSHEAP"\
+		"  " >> $PILLARFILE
+}
+
+# Security Onion Desktop
+function add_desktop_to_minion() {
+    printf '%s\n'\
+		"desktop:"\
+		"  gui:"\
+		"    enabled: true"\ >> $PILLARFILE
+}
+
+# Add basic host info to the minion file
+function add_host_to_minion() {
+    printf '%s\n'\
+    "host:"\
+	"  mainip: '$MAINIP'"\
+    "  mainint: '$MNIC'" >> $PILLARFILE
+}
+
+# Add sensoroni specific information - Can we pull node_adrees from the host pillar?
+function add_sensoroni_to_minion() {
+	printf '%s\n'\
+    "sensoroni:"\
+	"  enabled: True"\
+	"  config:"\
+	"    node_description: '${NODE_DESCRIPTION//\'/''}'"\
+    "  " >> $PILLARFILE
+}
+
+# Add sensoroni specific information - Can we pull node_adrees from the host pillar?
+function add_sensoroni_with_analyze_to_minion() {
+	printf '%s\n'\
+    "sensoroni:"\
+	"  enabled: True"\
+	"  config:"\
+    "    analyze:"\
+    "      enabled: True"\
+	"    node_description: '${NODE_DESCRIPTION//\'/''}'"\
+    "  " >> $PILLARFILE
+}
+
+# Sensor settings for the minion pillar
+function add_sensor_to_minion() {
+	echo "sensor:" >> $PILLARFILE
+	echo "  interface: '$INTERFACE'" >> $PILLARFILE
+	echo "  mtu: 9000" >> $PILLARFILE
+	echo "zeek:" >> $PILLARFILE
+	echo "  enabled: True" >> $PILLARFILE
+	echo "  config:" >> $PILLARFILE
+	echo "    node:" >> $PILLARFILE
+	echo "      lb_procs: '$CORECOUNT'" >> $PILLARFILE
+	echo "suricata:" >> $PILLARFILE
+	echo "  enabled: True " >> $PILLARFILE
+	if [[ $is_pcaplimit ]]; then
+	echo "  pcap:" >> $PILLARFILE
+	echo "    maxsize: $MAX_PCAP_SPACE" >> $PILLARFILE
+	fi
+	echo "  config:" >> $PILLARFILE
+	echo "    af-packet:" >> $PILLARFILE
+	echo "      threads: '$CORECOUNT'" >> $PILLARFILE
+	echo "pcap:" >> $PILLARFILE
+	echo "  enabled: True" >> $PILLARFILE
+	if [[ $is_pcaplimit ]]; then
+		echo "  config:" >> $PILLARFILE
+		echo "    diskfreepercentage: $DFREEPERCENT" >> $PILLARFILE
+	fi
+	echo "  " >> $PILLARFILE
+}
+
+
+function add_elastalert_to_minion() {
+    printf '%s\n'\
+    "elastalert:"\
+    "  enabled: True"\
+	"  " >> $PILLARFILE
+}
+
+function add_kibana_to_minion() {
+    printf '%s\n'\
+    "kibana:"\
+    "  enabled: True"\
+	"  " >> $PILLARFILE
+}
+
+function add_redis_to_minion() {
+    printf '%s\n'\
+    "redis:"\
+    "  enabled: True"\
+	"  " >> $PILLARFILE
+}
+
+function add_strelka_to_minion() {
+    printf '%s\n'\
+    "strelka:"\
+	"  backend:"\
+    "    enabled: True"\
+	"  filestream:"\
+    "    enabled: True"\
+	"  frontend:"\
+    "    enabled: True"\
+	"  manager:"\
+    "    enabled: True"\
+	"  coordinator:"\
+    "    enabled: True"\
+	"  gatekeeper:"\
+    "    enabled: True"\
+	"  " >> $PILLARFILE
+}
+
+function add_telegraf_to_minion() {
+    printf '%s\n'\
+    "telegraf:"\
+    "  enabled: True"\
+	"  " >> $PILLARFILE
+}
+
+function add_influxdb_to_minion() {
+    printf '%s\n'\
+    "influxdb:"\
+    "  enabled: True"\
+	"  " >> $PILLARFILE
+}
+
+function add_nginx_to_minion() {
+    printf '%s\n'\
+    "nginx:"\
+    "  enabled: True"\
+	"  " >> $PILLARFILE
+}
+
+function add_soc_to_minion() {
+    printf '%s\n'\
+    "soc:"\
+    "  enabled: True"\
+	"  " >> $PILLARFILE
+}
+
+function add_registry_to_minion() {
+    printf '%s\n'\
+    "registry:"\
+    "  enabled: True"\
+	"  " >> $PILLARFILE
+}
+
+function add_kratos_to_minion() {
+    printf '%s\n'\
+    "kratos:"\
+    "  enabled: True"\
+	"  " >> $PILLARFILE
+}
+
+function add_idstools_to_minion() {
+    printf '%s\n'\
+    "idstools:"\
+    "  enabled: True"\
+	"  " >> $PILLARFILE
+}
+
+function add_elastic_fleet_package_registry_to_minion() {
+    printf '%s\n'\
+    "elastic_fleet_package_registry:"\
+    "  enabled: True"\
+	"  " >> $PILLARFILE
+}
+
+function create_fleet_policy() {
+
+	# First, set the default output to Elasticsearch
+	# This is required because of the license output bug
+	JSON_STRING=$(jq -n \
+	'{ 
+		"name": "so-manager_elasticsearch", 
+		"type": "elasticsearch",
+		"is_default": true, 
+		"is_default_monitoring": false
+	}')
+
+    curl -K /opt/so/conf/elasticsearch/curl.config -L -X PUT "localhost:5601/api/fleet/outputs/so-manager_elasticsearch" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' -d "$JSON_STRING"
+
+	# Create the Fleet Server Policy
+	elastic_fleet_policy_create "FleetServer_$LSHOSTNAME" "Fleet Server - $LSHOSTNAME" "false" "120"
+
+    # Modify the default integration policy to update the policy_id with the correct naming
+	UPDATED_INTEGRATION_POLICY=$(jq --arg policy_id "FleetServer_$LSHOSTNAME" --arg name "fleet_server-$LSHOSTNAME" '
+    .policy_id = $policy_id |
+    .name = $name' /opt/so/conf/elastic-fleet/integrations/fleet-server/fleet-server.json)
+
+	# Add the Fleet Server Integration to the new Fleet Policy
+	elastic_fleet_integration_create "$UPDATED_INTEGRATION_POLICY"
+
+	# Set the default output back to the default
+	/sbin/so-elastic-fleet-outputs-update
+}
+
+function update_fleet_host_urls() {
+	# Query for current Fleet Host URLs & append New Fleet Node Hostname & IP
+    JSON_STRING=$(curl -K /opt/so/conf/elasticsearch/curl.config 'http://localhost:5601/api/fleet/fleet_server_hosts/grid-default' | jq --arg HOSTNAME "https://$LSHOSTNAME:8220" --arg IP "https://$MAINIP:8220" '.item.host_urls += [ $HOSTNAME, $IP ]  | {"name":"grid-default","is_default":true,"host_urls": .item.host_urls}')
+
+	# Update Fleet Host URLs
+	curl -K /opt/so/conf/elasticsearch/curl.config -L -X PUT "localhost:5601/api/fleet/fleet_server_hosts/grid-default" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' -d "$JSON_STRING"
+}
+
+function update_logstash_outputs() {
+	# Query for current Logstash outputs & append New Fleet Node Hostname & IP
+    JSON_STRING=$(curl -K /opt/so/conf/elasticsearch/curl.config 'http://localhost:5601/api/fleet/outputs/so-manager_logstash' | jq --arg HOSTNAME "$LSHOSTNAME:5055" --arg IP "$MAINIP:5055" -r '.item.hosts += [ $HOSTNAME, $IP ] | {"name":"grid-logstash","type":"logstash","hosts": .item.hosts,"is_default":true,"is_default_monitoring":true,"config_yaml":""}')
+
+	# Update Logstash Outputs
+    curl -K /opt/so/conf/elasticsearch/curl.config -L -X PUT "localhost:5601/api/fleet/outputs/so-manager_logstash" -H 'kbn-xsrf: true' -H 'Content-Type: application/json' -d "$JSON_STRING"
+}
+
+function checkMine() {
+	local func=$1
+	# make sure the minion sees itself in the mine since it needs to see itself for states as opposed to using salt-run
+	retry 20 1 "salt '$MINION_ID' mine.get '\*' '$func'" "$MINION_ID"
+
+}
+
+function createEVAL() {
+	is_pcaplimit=true
+	pcapspace
+	add_elasticsearch_to_minion
+	add_sensor_to_minion
+	add_strelka_to_minion
+	add_elastalert_to_minion
+	add_kibana_to_minion
+	add_telegraf_to_minion
+	add_influxdb_to_minion
+	add_nginx_to_minion
+	add_soc_to_minion
+	add_registry_to_minion
+	add_kratos_to_minion
+	add_idstools_to_minion
+	add_elastic_fleet_package_registry_to_minion
+}
+
+function createSTANDALONE() {
+	is_pcaplimit=true
+	pcapspace
+	add_elasticsearch_to_minion
+	add_logstash_to_minion
+	add_sensor_to_minion
+	add_strelka_to_minion
+	add_elastalert_to_minion
+	add_kibana_to_minion
+	add_redis_to_minion
+	add_telegraf_to_minion
+	add_influxdb_to_minion
+	add_nginx_to_minion
+	add_soc_to_minion
+	add_registry_to_minion
+	add_kratos_to_minion
+	add_idstools_to_minion
+	add_elastic_fleet_package_registry_to_minion
+}
+
+function createMANAGER() {
+	add_elasticsearch_to_minion
+	add_logstash_to_minion
+	add_elastalert_to_minion
+	add_kibana_to_minion
+	add_redis_to_minion
+	add_telegraf_to_minion
+	add_influxdb_to_minion
+	add_nginx_to_minion
+	add_soc_to_minion
+	add_registry_to_minion
+	add_kratos_to_minion
+	add_idstools_to_minion
+	add_elastic_fleet_package_registry_to_minion
+}
+
+function createMANAGERSEARCH() {
+	add_elasticsearch_to_minion
+	add_logstash_to_minion
+	add_elastalert_to_minion
+	add_kibana_to_minion
+	add_redis_to_minion
+	add_telegraf_to_minion
+	add_influxdb_to_minion
+	add_nginx_to_minion
+	add_soc_to_minion
+	add_registry_to_minion
+	add_kratos_to_minion
+	add_idstools_to_minion
+	add_elastic_fleet_package_registry_to_minion
+}
+
+function createIMPORT() {
+	add_elasticsearch_to_minion
+	add_sensor_to_minion
+	add_kibana_to_minion
+	add_telegraf_to_minion
+	add_influxdb_to_minion
+	add_nginx_to_minion
+	add_soc_to_minion
+	add_registry_to_minion
+	add_kratos_to_minion
+	add_idstools_to_minion
+	add_elastic_fleet_package_registry_to_minion
+}
+
+function createFLEET() {
+	add_fleet_to_minion
+	add_logstash_to_minion
+	create_fleet_policy
+	update_fleet_host_urls
+	#update_logstash_outputs
+	add_telegraf_to_minion
+	add_nginx_to_minion
+}
+
+function createIDH() {
+	add_idh_to_minion
+	add_telegraf_to_minion
+}
+
+function createHEAVYNODE() {
+	is_pcaplimit=true
+	PCAP_PERCENTAGE=1
+	DFREEPERCENT=21
+	pcapspace
+	add_elasticsearch_to_minion
+	add_elastic_agent_to_minion
+	add_sensor_to_minion
+	add_strelka_to_minion
+	add_redis_to_minion
+	add_telegraf_to_minion
+}
+
+function createSENSOR() {
+	is_pcaplimit=true
+	DFREEPERCENT=10
+	PCAP_PERCENTAGE=3
+	pcapspace
+	add_sensor_to_minion
+	add_strelka_to_minion
+	add_telegraf_to_minion
+}
+
+function createSEARCHNODE() {
+	add_elasticsearch_to_minion
+	add_logstash_to_minion
+	add_telegraf_to_minion
+}
+
+function createRECEIVER() {
+	add_logstash_to_minion
+	add_redis_to_minion
+	add_telegraf_to_minion
+}
+
+function createDESKTOP() {
+	add_desktop_to_minion
+	add_telegraf_to_minion
+}
+
+function testConnection() {
+	# the minion should be trying to auth every 10 seconds so 15 seconds should be more than enough time to see this in the log
+	# this retry was put in because it is possible that a minion is attempted to be pinged before it has authenticated and connected to the Salt master
+	# causing the first ping to fail and typically wouldn't be successful until the second ping
+	# this check may pass without the minion being authenticated if it was previously connected and the line exists in the log
+	retry 15 1 "grep 'Authentication accepted from $MINION_ID' /opt/so/log/salt/master"
+	local retauth=$?
+	if [[ $retauth != 0 ]]; then
+		echo "The Minion did not authenticate with the Salt master in the allotted time"
+		echo "Deleting the key"
+		deleteminion
+		exit 1
+	fi
+
+	retry 15 3 "salt '$MINION_ID' test.ping" True
+	local ret=$?
+	if [[ $ret != 0 ]]; then
+		echo "The Minion has been accepted but is not online. Try again later"
+		echo "Deleting the key"
+		deleteminion
+		exit 1
+	fi
+}
+
+function addMinion() {
+	# Accept the salt key
+	acceptminion
+	# Test to see if the minion was accepted
+	testConnection
+	# Pull the info from the file to build what is needed
+	getinstallinfo
+}
+
+function updateMineAndApplyStates() {
+
+	#checkMine "network.ip_addrs"
+	# calls so-common and set_minionid sets MINIONID to local minion id
+	set_minionid
+	# if this is a searchnode or heavynode, start downloading logstash and elasticsearch containers while the manager prepares for the new node
+	if [[ "$NODETYPE" == "SEARCHNODE" || "$NODETYPE" == "HEAVYNODE" ]]; then
+		salt-run state.orch orch.container_download pillar="{'setup': {'newnode': $MINION_ID }}" > /dev/null 2>&1 &
+	fi
+	if [[ "$NODETYPE" == "RECEIVER" ]]; then
+		# Setup nodeid for Kafka
+		salt-call state.apply kafka.nodes queue=True
+	fi
+	# $MINIONID is the minion id of the manager and $MINION_ID is the target node or the node being configured
+	salt-run state.orch orch.deploy_newnode pillar="{'setup': {'manager': $MINIONID, 'newnode': $MINION_ID }}" > /dev/null 2>&1 &
+}
+
+function setupMinionFiles() {
+	# Check to see if nodetype is set
+	if [ -z $NODETYPE ]; then
+		echo "No node type specified"
+		exit 1
+	fi
+	create_minion_files
+	add_host_to_minion
+	managers=("EVAL" "STANDALONE" "IMPORT" "MANAGER" "MANAGERSEARCH")
+	if echo "${managers[@]}" | grep -qw "$NODETYPE"; then
+		add_sensoroni_with_analyze_to_minion
+	else
+		add_sensoroni_to_minion
+	fi
+
+	create$NODETYPE
+	echo "Minion file created for $MINION_ID"	
+}
+
+case "$OPERATION" in
+	"add")
+		addMinion
+		setupMinionFiles
+		updateMineAndApplyStates
+		;;
+
+	"delete")
+		deleteMinionFiles
+		deleteMinion
+		;;
+
+	"list")
+		listMinions
+		;;
+
+	"reject")
+		rejectMinion
+		;;
+
+	"restart")
+		restartMinion
+		;;
+		
+	"setup")
+		# only should be invoked directly during setup, never manually
+		setupMinionFiles
+		;;
+
+	"test")
+		testMinion
+		;;
+	*)
+		usage
+		;;
+esac
